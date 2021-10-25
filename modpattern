@@ -1,0 +1,843 @@
+#!/usr/bin/env python
+
+import sys
+import os
+import shutil
+import argparse
+import sqlite3
+import warnings
+
+import multiprocessing as mp
+
+from uuid import uuid4
+from collections import defaultdict as dd
+
+import numpy as np
+import pysam
+
+import torch
+import torchvision
+from torchvision import transforms, utils, datasets
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler
+from torchsummary import summary
+from sklearn.mixture import GaussianMixture
+from sklearn.metrics import classification_report
+
+import matplotlib
+# Force matplotlib to not use any Xwindows backend.
+matplotlib.use('Agg')
+
+# Illustrator compatibility
+new_rc_params = {'text.usetex': False, "svg.fonttype": 'none'}
+matplotlib.rcParams.update(new_rc_params)
+
+import matplotlib.pyplot as plt
+
+import logging
+FORMAT = '%(asctime)s %(message)s'
+logging.basicConfig(format=FORMAT)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+
+np.random.seed(0)
+torch.manual_seed(0)
+
+
+class ModProfileClassifier(nn.Module):
+    def __init__(self):
+        super(ModProfileClassifier, self).__init__()
+        self.block1 = self.conv_block(c_in=3, c_out=256, dropout=0.4, kernel_size=5, stride=1, padding=2)
+        self.block2 = self.conv_block(c_in=256, c_out=128, dropout=0.25, kernel_size=3, stride=1, padding=1)
+        self.block3 = self.conv_block(c_in=128, c_out=64, dropout=0.1, kernel_size=3, stride=1, padding=1)
+        self.lastcnn = nn.Conv2d(in_channels=64, out_channels=2, kernel_size=56, stride=1, padding=0)
+        self.maxpool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.maxpool(x)
+        x = self.block3(x)
+        x = self.maxpool(x)
+        x = self.lastcnn(x)
+        return x
+
+    def conv_block(self, c_in, c_out, dropout,  **kwargs):
+        seq_block = nn.Sequential(
+            nn.Conv2d(in_channels=c_in, out_channels=c_out, **kwargs),
+            nn.BatchNorm2d(num_features=c_out),
+            nn.ReLU(),
+            nn.Dropout2d(p=dropout)
+        )
+
+        return seq_block
+
+
+def binary_acc(y_pred, y_test):
+    y_pred_tag = torch.log_softmax(y_pred, dim = 1)
+    _, y_pred_tags = torch.max(y_pred_tag, dim = 1)
+    correct_results_sum = (y_pred_tags == y_test).sum().float()
+    acc = correct_results_sum/y_test.shape[0]
+    acc = torch.round(acc * 100)
+    return acc
+
+
+def get_modnames(meth_db):
+    if not os.path.exists(meth_db):
+        sys.exit('methylartist database (%s) does not exist, check that full path is included if not in current working directory.' % meth_db)
+
+    conn = sqlite3.connect(meth_db)
+    c = conn.cursor()
+
+    mod_names = []
+
+    for row in c.execute("SELECT DISTINCT mod FROM modnames"):
+        mod_names.append(row[0])
+
+    return mod_names
+
+
+def fetch_reads(bam_fn, chrom, start, end, fetch_HP=None):
+    bam = pysam.AlignmentFile(bam_fn)
+
+    reads = []
+
+    for read in bam.fetch(chrom, start, end):
+        if fetch_HP:
+            HP = None
+
+            for tag in read.get_tags():
+                if tag[0] == 'HP':
+                    HP = tag[1]
+            
+            if HP != int(fetch_HP):
+                continue
+
+        reads.append(read.query_name)
+    
+    return reads
+
+
+def fetch_mod_sites(dbs, reads, mod, start, end):
+    c_lookup = {}
+
+    for db in dbs:
+        conn = sqlite3.connect(db)
+        c_lookup[db] = conn.cursor()
+
+    mod_sites = dd(dict)
+
+    for readname in reads:
+        for db in dbs:
+            c = c_lookup[db]
+            for row in c.execute("SELECT chrom, pos, stat, methstate, modname FROM methdata WHERE readname='%s' ORDER BY pos" % readname):
+
+                mod_chrom, mod_start, stat, methstate, modname = row
+
+                if modname != mod:
+                    continue
+                
+                if mod_start < start or mod_start > end:
+                    continue
+
+                if methstate in (1,-1): # unambiguous only
+                    mod_sites[readname][int(mod_start)] = methstate
+
+    return mod_sites
+
+
+def site_viz(args, mod_sites, chrom, start, end, tmpdir, obj='png'):
+    np.set_printoptions(threshold=np.inf)
+    img = np.zeros((len(mod_sites),end-start))
+    
+    for i, readname in enumerate(mod_sites):
+        for pos, modcall in mod_sites[readname].items():
+            j = pos-start-1
+            img[i][j] = modcall
+
+    if obj=='img':
+        if np.shape(img)[0] < int(args.min_reads):
+            return None
+    
+        if np.shape(img)[1] < int(args.min_motifs):
+            return None
+
+        return img
+
+    zero_idx = np.argwhere(np.all(img[...,:]==0, axis=0))
+    img = np.delete(img, zero_idx, axis=1)
+
+    if np.shape(img)[0] < int(args.min_reads):
+        return None
+    
+    if np.shape(img)[1] < int(args.min_motifs):
+        return None
+
+    if obj == 'png':
+        png = tmpdir + '/%s_%d_%d.png' % (chrom, start, end)
+        plt.imshow(img, interpolation='nearest')
+        plt.savefig(png, bbox_inches='tight')
+
+        return png
+    
+    return img
+
+
+def profile(args, bam, dbs, chrom, start, end, tmpdir, obj, phase):
+    dbs = dbs.split(',')
+
+    reads = fetch_reads(bam, chrom, start, end, fetch_HP=phase)
+
+    if len(reads) < int(args.min_reads):
+        return None
+
+    mod_sites = fetch_mod_sites(dbs, reads, args.mod, start, end)
+    img = site_viz(args, mod_sites, chrom, start, end, tmpdir, obj=obj)
+
+    return img
+
+
+def process_profiles(args, bam, dbs, fn, tmpdir, phase=0, obj='png', set_context=True):
+    if set_context:
+        mp.set_start_method("spawn")
+
+    pool = mp.Pool(processes=int(args.procs))
+
+    results = []
+
+    if not args.phased:
+        phase = None
+
+    with open(fn) as bed:
+        for line in bed:
+            chrom, start, end = line.strip().split()[:3]
+            start = int(start)
+            end = int(end)
+            res = pool.apply_async(profile, [args, bam, dbs, chrom, start, end, tmpdir, obj, phase])
+            results.append(res)
+
+    pool.close()
+
+    profiles = []
+
+    for res in results:
+        img = res.get()
+
+        if not img:
+            continue
+
+        profiles.append(img)
+
+    return profiles
+
+
+def fai_to_bed(args, run_id, minlen=10e6):
+    width = int(args. width)
+    tmp = args.tmp
+    batchsize = int(args.batchsize)
+    bed_fns = []
+
+    logger.info('chunking %s (%s) to bed,  window size: %d, batch size: %d' % (args.fai, run_id, width, batchsize))
+
+    batch = 0
+    bed_fn = tmp + '/' + '.'.join(args.fai.split('.')[:-1]) + "." + run_id + 'batch.%d.tmp.bed' % batch
+    
+    bed = open(bed_fn, 'w')
+
+    i = 0
+
+    with open(args.fai) as fai:
+        for line in fai:
+            chrom, chrlen = line.strip().split()[:2]
+            chrlen = int(chrlen)
+
+            if chrlen < minlen:
+                continue
+
+            for seg_start in range(0, chrlen, width):
+                i += 1
+                seg_end = seg_start + width
+
+                if seg_end > chrlen:
+                    seg_end = chrlen
+                
+                bed.write('%s\t%d\t%d\n' % (chrom, seg_start, seg_end))
+    
+                if i % batchsize == 0:
+                    bed.close()
+                    bed_fns.append(bed_fn)
+
+                    batch += 1
+                    bed_fn = tmp + '/' + '.'.join(args.fai.split('.')[:-1]) + "." + run_id + 'batch.%d.tmp.bed' % batch
+                    bed = open(bed_fn, 'w')
+
+    bed.close()
+    bed_fns.append(bed_fn)
+
+    return bed_fns
+
+
+def train_model(device, model, criterion, optimizer, train_loader, val_loader, max_epochs=1000):
+    accuracy_stats = {'train': [], "val": []}
+    loss_stats = {'train': [], "val": []}
+
+    logger.info("Training model")
+
+    for e in range(1, max_epochs): # TODO PARAM
+
+        # TRAINING
+        train_epoch_loss = 0
+        train_epoch_acc = 0
+        model.train()
+
+        for X_train_batch, y_train_batch in train_loader:
+            X_train_batch, y_train_batch = X_train_batch.to(device), y_train_batch.to(device)
+            optimizer.zero_grad()
+            y_train_pred = model(X_train_batch).squeeze()
+            train_loss = criterion(y_train_pred, y_train_batch)
+            train_acc = binary_acc(y_train_pred, y_train_batch)
+            train_loss.backward()
+            optimizer.step()
+            train_epoch_loss += train_loss.item()
+            train_epoch_acc += train_acc.item()
+
+        # VALIDATION
+        with torch.no_grad():
+            val_epoch_loss = 0
+            val_epoch_acc = 0
+            model.eval()
+            
+            for X_val_batch, y_val_batch in val_loader:
+                X_val_batch, y_val_batch = X_val_batch.to(device), y_val_batch.to(device)
+                y_val_pred = model(X_val_batch).squeeze()
+                y_val_pred = torch.unsqueeze(y_val_pred, 0)
+                val_loss = criterion(y_val_pred, y_val_batch)
+                val_acc = binary_acc(y_val_pred, y_val_batch)
+                val_epoch_loss += val_loss.item()
+                val_epoch_acc += val_acc.item()
+
+        loss_stats['train'].append(train_epoch_loss/len(train_loader))
+        loss_stats['val'].append(val_epoch_loss/len(val_loader))
+        accuracy_stats['train'].append(train_epoch_acc/len(train_loader))
+        accuracy_stats['val'].append(val_epoch_acc/len(val_loader))
+        logger.info(f'Epoch {e+0:02}: | Train Loss: {train_epoch_loss/len(train_loader):.5f} | Val Loss: {val_epoch_loss/len(val_loader):.5f} | Train Acc: {train_epoch_acc/len(train_loader):.3f}| Val Acc: {val_epoch_acc/len(val_loader):.3f}')
+
+        if train_epoch_acc/len(train_loader) > 99.0 and val_epoch_acc/len(val_loader) > 99.0:
+            logger.info('end early')
+            break
+
+    return model
+
+
+def test_model(device, model, test_loader):
+    y_pred_list = []
+    y_true_list = []
+    with torch.no_grad():
+        for x_batch, y_batch in test_loader:
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            y_test_pred = model(x_batch)
+            _, y_pred_tag = torch.max(y_test_pred, dim = 1)
+            y_pred_list.append(y_pred_tag.cpu().numpy())
+            y_true_list.append(y_batch.cpu().numpy())
+    
+    y_pred_list = [i[0][0][0] for i in y_pred_list]
+    y_true_list = [i[0] for i in y_true_list]
+
+    print(classification_report(y_true_list, y_pred_list))
+
+
+def process_img_batch(device, model, img_dir, debug_dir=None):
+    img_xform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+
+    modpattern_dataset = datasets.ImageFolder(root=img_dir, transform=img_xform)
+
+    # print(modpattern_dataset)
+    # print(modpattern_dataset.class_to_idx)
+
+    loader = DataLoader(dataset=modpattern_dataset, shuffle=False, batch_size=1)
+
+    results = []
+
+    model.eval()
+
+    with torch.no_grad():
+        for i, (x_batch, y_batch) in enumerate(loader):
+            sample_fn, _ = loader.dataset.samples[i]
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            y_test_pred = model(x_batch)
+
+            probs = F.softmax(y_test_pred, dim=1)
+            p_0 = float(probs[0][0][0][0])
+            p_1 = float(probs[0][1][0][0])
+
+            #print(sample_fn, p_0, p_1, float(y_test_pred[0][0][0][0]), float(y_test_pred[0][1][0][0]))
+
+            prediction = 'amb'
+            p = p_1
+
+            if p_0 > 0.99:
+                prediction = 'neg'
+                p = p_0
+
+            if p_1 > 0.99:
+                prediction = 'pos'
+                p = p_1
+
+            if debug_dir:
+                debug_fn = debug_dir + '/' + '.'.join(os.path.basename(sample_fn).split('.')[:-1]) + '.%.3f.%s.png' % (p, prediction)
+                shutil.copy(sample_fn, debug_fn)
+
+            results.append([sample_fn, prediction, p_0, p_1])
+    
+    return results
+
+def train(args):
+    args.phased = False
+    dbs = args.db.split(',')
+
+    avail_mods = []
+
+    for db in dbs:
+        avail_mods += get_modnames(db)
+    
+    if args.mod not in avail_mods:
+        logger.error('--mod %s not available. Possible options: %s' % (args.mod, ','.join(list(set(avail_mods)))))
+        sys.exit(1)
+
+
+    if os.path.exists(args.tmp):
+        if not os.path.exists(args.tmp+'/pos'):
+            os.mkdir(args.tmp+'/pos')
+
+        if not os.path.exists(args.tmp+'/neg'):
+            os.mkdir(args.tmp+'/neg')
+
+    else:
+        os.makedirs(args.tmp)
+        os.mkdir(args.tmp+'/pos')
+        os.mkdir(args.tmp+'/neg')
+
+
+    pos_files = None
+    neg_files = None
+    pos_dir = None
+    neg_dir = None
+
+
+    if not os.path.isdir(args.pos):
+        logger.info('profiling positive sites from %s' % args.pos)
+        pos_files = process_profiles(args, args.bam, args.db, args.pos, args.tmp+'/pos')
+        pos_dir = args.tmp+'/pos'
+    else:
+        pos_files = [args.pos + '/' + fn for fn in os.listdir(args.pos)]
+        pos_dir = args.pos
+
+    logger.info('%d pos examples' % len(pos_files))
+
+
+    if not os.path.isdir(args.neg):
+        logger.info('profiling negative sites from %s' % args.neg)
+        neg_files = process_profiles(args, args.bam, args.db, args.neg, args.tmp+'/neg', set_context=False)
+        neg_dir = args.tmp+'/neg'
+    else:
+        neg_files = [args.neg + '/' + fn for fn in os.listdir(args.neg)]
+        neg_dir = args.neg
+
+    logger.info('%d neg examples' % len(neg_files))
+
+
+    run_id = 'modpattern.%s_%s' % (args.mod, str(uuid4()))
+    logger.info("run ID: %s" % run_id)
+
+    os.mkdir(run_id)
+    logger.info('copy images...')
+    shutil.copytree(pos_dir, run_id+'/pos')
+    shutil.copytree(neg_dir, run_id+'/neg')
+
+
+    if args.images_only:
+        logger.info('skipping training due to --images_only')
+        logger.info('neg and pos images in %s' % run_id)
+        sys.exit()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info('torch device: %s' % device)
+
+    img_xform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+
+    logger.info('load dataset...')
+    modpattern_dataset = datasets.ImageFolder(root=run_id, transform=img_xform)
+
+    dataset_size = len(modpattern_dataset)
+    dataset_indices = list(range(dataset_size))
+    np.random.shuffle(dataset_indices)
+
+    val_split_index = int(np.floor(0.2 * dataset_size))
+    test_split_index = int(np.floor(0.4 * dataset_size))
+
+    train_idx = dataset_indices[test_split_index:]
+    val_idx = dataset_indices[val_split_index:test_split_index]
+    test_idx = dataset_indices[:val_split_index]
+
+    logger.info('train size: %d, val size: %d, test size: %d' % (len(train_idx), len(val_idx), len(test_idx)))
+
+    train_sampler = SubsetRandomSampler(train_idx)
+    val_sampler = SubsetRandomSampler(val_idx)
+    test_sampler = SubsetRandomSampler(test_idx)
+
+    train_loader = DataLoader(dataset=modpattern_dataset, shuffle=False, batch_size=16, sampler=train_sampler)
+    val_loader = DataLoader(dataset=modpattern_dataset, shuffle=False, batch_size=1, sampler=val_sampler)
+    test_loader = DataLoader(dataset=modpattern_dataset, shuffle=False, batch_size=1, sampler=test_sampler)
+
+    model = ModProfileClassifier()
+    model.to(device)
+    summary(model, (3, 224, 224))
+    #print(model)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    model = train_model(device, model, criterion, optimizer, train_loader, val_loader, max_epochs=int(args.max_epochs))
+    
+    test_model(device, model, test_loader)
+
+    with warnings.catch_warnings():  # silence serialization warnings
+        warnings.simplefilter("ignore")
+        torch.save(model, '%s.model.pt' % run_id)
+
+    logger.info('model saved to %s.model.pt' % run_id)
+
+
+def smooth(x, window_len=8, window='hanning'):
+    # used for locus plots
+    ''' modified from scipy cookbook: https://scipy-cookbook.readthedocs.io/items/SignalSmooth.html '''
+
+    assert window_len % 2 == 0, '--smoothwindowsize must be an even number'
+    assert x.ndim == 1
+
+    if x.size <= window_len:
+        return x
+
+    if window_len < 3:
+        return x
+
+    assert window in ['flat', 'hanning', 'hamming', 'bartlett', 'blackman']
+
+    s=np.r_[x[window_len-1:0:-1],x,x[-2:-window_len-1:-1]]
+    
+    if window == 'flat': #moving average
+        w=np.ones(window_len,'d')
+    else:
+        w=eval('np.'+window+'(window_len)')
+
+    y=np.convolve(w/w.sum(),s,mode='valid')
+
+    return y[(int(window_len/2)-1):-(int(window_len/2))]
+
+
+def mixmodel(pos, reg_covar=1e-4, max_iter=1000, max_pos=2):
+    pos = np.asarray(pos).reshape(-1,1)
+
+    N = np.arange(1,max_pos+1)
+    models = [None for i in range(len(N))]
+
+    for i in range(len(N)):
+        models[i] = GaussianMixture(N[i], reg_covar=reg_covar, max_iter=max_iter, n_init=max_pos, random_state=1).fit(pos)
+
+    AIC = [m.aic(pos) for m in models]
+
+    model = models[np.argmin(AIC)] # best-fit mixture
+
+    means = list(model.means_.reshape(1,-1)[0])
+
+    return sorted(means)
+
+
+def refine_predictions(args, bam, dbs, run_id, tmpdir, preds, phase=None, set_context=True, output_region_preds=True, min_call_depth=8, min_peak_width=3, signal_type=0):
+    if set_context:
+        mp.set_start_method("spawn")
+
+    assert signal_type in (0,1)
+
+    fg = 0
+    bg = 1
+
+    if signal_type == 1:
+        fg = 1
+        bg = 0
+
+    if output_region_preds:
+        region_bed = '%s.region.bed' % run_id
+
+        with open(region_bed, 'w') as bed:
+            for p in preds:
+                fn, pred, p_neg, p_pos = p
+                chrom, start, end = os.path.basename(fn).split('.')[0].split('_')
+
+                bed.write('\t'.join(map(str, (chrom, start, end, pred, p_neg, p_pos))) + '\n')
+
+        logger.info('wrote regional predictions to %s' % region_bed)
+
+    pool = mp.Pool(processes=int(args.procs))
+
+    results = []
+
+    for p in preds:
+        fn, pred, p_neg, p_pos = p
+        chrom, start, end = os.path.basename(fn).split('.')[0].split('_')
+
+        start = int(start)
+        end = int(end)
+
+
+        if pred == 'pos':
+            res = pool.apply_async(refine_peaks, [args, bam, dbs, chrom, start, end, tmpdir, min_call_depth, min_peak_width, fg, bg, phase])
+            results.append(res)
+            #peaks = refine_peaks(args, chrom, start, end, tmpdir, min_call_depth, min_peak_width, fg, bg)
+            
+    pool.close()
+
+    peaks = []
+
+    for res in results:
+        p = res.get()
+        if p is not None:
+            peaks += p
+    
+    return peaks
+            
+
+def refine_peaks(args, bam, dbs, chrom, start, end, tmpdir, min_call_depth, min_peak_width, fg, bg, phase):
+    pf = profile(args, bam, dbs, chrom, start, end, tmpdir, 'img', phase)
+
+    if pf is None:
+        logger.warning('unable to profile %s:%d-%d' % (chrom, start, end))
+        return None
+
+    m_count = (pf==1).sum(axis=0)
+    u_count = (pf==-1).sum(axis=0)
+
+    m_frac = []
+    pos_lookup = {} # i --> pos
+    j = 0
+
+    for i in range(len(m_count)):
+        if m_count[i] + u_count[i] >= min_call_depth:
+            m_frac.append(m_count[i] / (m_count[i] + u_count[i]))
+            pos_lookup[j] = start+i
+            j += 1
+
+    if len(m_frac) < min_peak_width*3:
+        logger.debug('too few columns for site: %s:%d-%d' % (chrom, start, end))
+        return None
+
+    m_frac_arr = np.asarray(m_frac)
+    sm_frac_arr = smooth(m_frac_arr)
+    gmm_means = mixmodel(sm_frac_arr)
+
+    if len(gmm_means) == 1:
+        logger.debug('site %s:%d-%d best fit by single mean, skipping.' % (chrom, start, end))
+        return None
+
+    score = np.log(gmm_means[0])/np.log(gmm_means)[1]
+
+    calls = np.asarray(list(map(int, (abs(sm_frac_arr - gmm_means[0]) > abs(sm_frac_arr - gmm_means[1])))))
+
+    # fill in fg gaps < min_peak_width
+    mask_w = min_peak_width + 2
+
+    for i in range(mask_w, len(calls)):
+        if calls[i-mask_w] == fg and calls[i] == fg:
+            calls[i-mask_w:i] = fg
+
+    peaks = []
+    peak = []
+
+    for i in range(1, len(calls)):
+        if calls[i] == fg:
+            peak.append(i)
+
+        if calls[i] == bg and calls[i-1] == fg:
+            if len(peak) > min_peak_width:
+                peaks.append((chrom, pos_lookup[peak[0]], pos_lookup[peak[-1]], score))
+            peak = []
+
+    if len(peak) >= min_peak_width:
+        peaks.append((chrom, pos_lookup[peak[0]], pos_lookup[peak[-1]], score))
+    
+    return peaks
+
+
+def call(args):
+    if not os.path.exists(args.tmp):
+        logger.info('create tmp dir: %s' % args.tmp)
+        os.makedirs(args.tmp)
+    
+    run_id = 'modpattern.' + str(uuid4())
+    if args.outname:
+        run_id = args.outname
+
+    signal_type = -1
+
+    if list(args.peaktype)[0] in ('u', 'U'):
+        signal_type = 0
+    
+    if list(args.peaktype)[0] in ('m', 'M'):
+        signal_type = 1
+
+    if signal_type == -1:
+        sys.exit('cannot determine peak type from input: %s, try m for methylated and u for unmethylated' % args.peaktype)
+
+    logger.info('using run id %s' % run_id)
+    tmp_img = args.tmp + '/' + run_id + '/img'
+    tmp_run = args.tmp + '/' + run_id
+    os.makedirs(tmp_img)
+    logger.info('tmp image dir: ' +  tmp_img)
+
+    dbs = args.db.split(',')
+
+    avail_mods = []
+
+    for db in dbs:
+        avail_mods += get_modnames(db)
+    
+    if args.mod not in avail_mods:
+        logger.error('--mod %s not available. Possible options: %s' % (args.mod, ','.join(list(set(avail_mods)))))
+        sys.exit(1)
+
+    model = torch.load(args.model)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info('torch device: %s' % device)
+
+    if args.images:
+        if args.debug_dir:
+            if not os.path.exists(args.debug_dir):
+                os.makedirs(args.debug_dir)
+
+        seg_predictions = process_img_batch(device, model, args.images, debug_dir=args.debug_dir)
+        peaks = refine_predictions(args, args.bam, args.db, run_id, tmp_img, seg_predictions, min_call_depth=int(args.min_call_depth), min_peak_width=int(args.min_peak_width), signal_type=signal_type)
+
+        with open(peak_bed, 'w') as bed:
+            for peak in peaks:
+                bed.write('\t'.join(map(str, peak)) + '\n')
+
+        logger.info('wrote %d peaks to %s' % (len(peaks), peak_bed))
+
+        sys.exit()
+
+    call_beds = [args.bed]
+
+    if args.fai:
+        if args.bed:
+            logger.warning('using bed file %s instead of .fai file %s' % (args.bed, args.fai))
+        
+        call_beds = fai_to_bed(args, run_id)
+
+    set_context = True
+
+    phases = [0]
+
+    if args.phased:
+        phases = [0,1]
+
+    for phase in phases:
+        peak_bed = '%s.peaks.bed' % run_id
+        region_bed = '%s.regions.bed' % run_id
+
+        if args.phased:
+            peak_bed = '%s.phase_%d.peaks.bed' % (run_id, phase)
+            region_bed = '%s.phase_%d.regions.bed' % (run_id, phase)
+
+        peak_out = open(peak_bed, 'w')
+        region_out = open(region_bed, 'w')
+
+        for i, batch_bed in enumerate(call_beds):
+            logger.info('batch %d of %d: building images' % (i+1, len(call_beds)))
+            batch_pngs = process_profiles(args, args.bam, args.db, batch_bed, tmp_img, phase=phase, set_context=set_context)
+
+            set_context = False
+
+            logger.info('batch %d of %d: calling regions' % (i+1, len(call_beds)))
+            seg_predictions = process_img_batch(device, model, tmp_run, debug_dir=args.debug_dir)
+
+            with open(region_bed, 'w') as bed:
+                for p in seg_predictions:
+                    fn, pred, p_neg, p_pos = p
+                    chrom, start, end = os.path.basename(fn).split('.')[0].split('_')
+                    region_out.write('\t'.join(map(str, (chrom, start, end, pred, p_neg, p_pos))) + '\n')
+            
+            logger.info('batch %d of %d: wrote %d regions to %s' % (i+1, len(call_beds), len(seg_predictions), region_bed))
+
+            logger.info('batch %d of %d: calling peaks' % (i+1, len(call_beds)))
+            peaks = refine_predictions(args, args.bam, args.db, run_id, tmp_run, seg_predictions, phase=phase, set_context=set_context, output_region_preds=False, min_call_depth=int(args.min_call_depth), min_peak_width=int(args.min_peak_width), signal_type=signal_type)
+
+            for peak in peaks:
+                peak_out.write('\t'.join(map(str, peak)) + '\n')
+
+            logger.info('batch %d of %d: wrote %d peaks to %s' % (i+1, len(call_beds), len(peaks), peak_bed))
+
+            logger.info('batch %d of %d: cleanup files' % (i+1, len(call_beds)))
+            for fn in batch_pngs:
+                os.remove(fn)
+
+    peak_out.close()
+    region_out.close()
+
+
+def main(args):
+    logger.info('starting peakscan with command: %s' % ' '.join(sys.argv))
+    args.func(args)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='call methylation peaks/troughs/features')
+    subparsers = parser.add_subparsers(title="mode", dest="mode")
+    subparsers.required = True
+
+    __version__ = "0.1"
+    parser.add_argument('-v', '--version', action='version', version='%(prog)s {version}'.format(version=__version__))
+
+    parser_train = subparsers.add_parser('train')
+    parser_call  = subparsers.add_parser('call')
+
+    parser_train.set_defaults(func=train)
+    parser_call.set_defaults(func=call)
+
+    parser_train.add_argument('-b', '--bam', required=True)
+    parser_train.add_argument('-d', '--db', required=True, help='methylartist database')
+    parser_train.add_argument('-m', '--mod', required=True, help='modificaiton (if not sure, guess and then select from list if error)')
+    parser_train.add_argument('-p', '--pos', required=True, help='positive examples (BED-3 or folder with images)')
+    parser_train.add_argument('-n', '--neg', required=True, help='negative examples (BED-3 or folder with images)')
+    parser_train.add_argument('--min_reads', default=10)
+    parser_train.add_argument('--min_motifs', default=100)
+    parser_train.add_argument('--images_only', default=False, action='store_true', help='output images from training input data only (do not train model)')
+    parser_train.add_argument('--tmp', default='/tmp')
+    parser_train.add_argument('--procs', default=1)
+    parser_train.add_argument('--testfrac', default=0.2, help='fraction of examples used for testing')
+    parser_train.add_argument('--max_epochs', default=1000, help='max epochs')
+
+    parser_call.add_argument('-b', '--bam', required=True)
+    parser_call.add_argument('-f', '--fai', default=None, help='reference genome index (.fai from samtools index or list of chrom <tab> length)')
+    parser_call.add_argument('--bed', default=None, help='BED=3 file (overrides --fai)')
+    parser_call.add_argument('-d', '--db', required=True, help='methylartist database(s)')
+    parser_call.add_argument('-m', '--mod', required=True, help='modificaiton (if not sure, guess and then select from list if error)')
+    parser_call.add_argument('--model', required=True, help='trained model')
+    parser_call.add_argument('-p', '--peaktype', required=True, help='methylated (m) or unmethylated (u)')
+    parser_call.add_argument('-w', '--width', required=True, help='width (should match training data)')
+    parser_call.add_argument('--phased', default=False, action='store_true')
+    parser_call.add_argument('-o', '--outname', default=None, help='output basename (default to random UUID)')
+    parser_call.add_argument('-s', '--batchsize', default=10000, help='batch size (default=10000)')
+    parser_call.add_argument('--min_call_depth', default=8)
+    parser_call.add_argument('--min_peak_width', default=3)
+    parser_call.add_argument('--min_reads', default=10)
+    parser_call.add_argument('--min_motifs', default=100)
+    parser_call.add_argument('--procs', default=1)
+    parser_call.add_argument('--images', default=None, help='for debugging')
+    parser_call.add_argument('--debug_dir', default=None, help='for debugging')
+    parser_call.add_argument('--tmp', default='/tmp')
+
+    args = parser.parse_args()
+    main(args)
