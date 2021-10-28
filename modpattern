@@ -35,6 +35,7 @@ new_rc_params = {'text.usetex': False, "svg.fonttype": 'none'}
 matplotlib.rcParams.update(new_rc_params)
 
 import matplotlib.pyplot as plt
+from matplotlib import colors
 
 import logging
 FORMAT = '%(asctime)s %(message)s'
@@ -143,8 +144,10 @@ def fetch_mod_sites(dbs, reads, mod, start, end):
                 if mod_start < start or mod_start > end:
                     continue
 
-                if methstate in (1,-1): # unambiguous only
-                    mod_sites[readname][int(mod_start)] = methstate
+                #if methstate in (1,-1): # unambiguous only
+                    #mod_sites[readname][int(mod_start)] = methstate
+
+                mod_sites[readname][int(mod_start)] = float(stat)
 
     return mod_sites
 
@@ -175,6 +178,8 @@ def site_viz(args, mod_sites, chrom, start, end, tmpdir, obj='png'):
     
     if np.shape(img)[1] < int(args.min_motifs):
         return None
+
+    #print(img)
 
     if obj == 'png':
         png = tmpdir + '/%s_%d_%d.png' % (chrom, start, end)
@@ -454,8 +459,8 @@ def train(args):
 
     os.mkdir(run_id)
     logger.info('copy images...')
-    shutil.copytree(pos_dir, run_id+'/pos')
-    shutil.copytree(neg_dir, run_id+'/neg')
+    shutil.move(pos_dir, run_id+'/pos')
+    shutil.move(neg_dir, run_id+'/neg')
 
 
     if args.images_only:
