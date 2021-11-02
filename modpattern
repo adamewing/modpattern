@@ -144,10 +144,10 @@ def fetch_mod_sites(dbs, reads, mod, start, end):
                 if mod_start < start or mod_start > end:
                     continue
 
-                #if methstate in (1,-1): # unambiguous only
-                    #mod_sites[readname][int(mod_start)] = methstate
+                if methstate in (1,-1): # unambiguous only
+                    mod_sites[readname][int(mod_start)] = methstate
 
-                mod_sites[readname][int(mod_start)] = float(stat)
+                #mod_sites[readname][int(mod_start)] = float(stat)
 
     return mod_sites
 
