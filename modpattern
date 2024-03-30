@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+import operator
+from random import sample
 import sys
 import os
 import shutil
@@ -11,9 +13,14 @@ import multiprocessing as mp
 
 from uuid import uuid4
 from collections import defaultdict as dd
+from operator import itemgetter
 
+from PIL.Image import merge
+
+import networkx as nx
 import numpy as np
 import pysam
+from bx.intervals.intersection import Intersecter, Interval
 
 import torch
 import torchvision
@@ -90,13 +97,28 @@ def get_modnames(meth_db):
     if not os.path.exists(meth_db):
         sys.exit('methylartist database (%s) does not exist, check that full path is included if not in current working directory.' % meth_db)
 
-    conn = sqlite3.connect(meth_db)
-    c = conn.cursor()
-
     mod_names = []
 
-    for row in c.execute("SELECT DISTINCT mod FROM modnames"):
-        mod_names.append(row[0])
+    if meth_db.endswith('.db'):
+        conn = sqlite3.connect(meth_db)
+        c = conn.cursor()
+
+        for row in c.execute("SELECT DISTINCT mod FROM modnames"):
+            mod_names.append(row[0])
+
+    elif meth_db.endswith('.bam'):
+        bam = pysam.AlignmentFile(meth_db)
+        logger.info(f'searching for mod names in {meth_db}, if this takes a long time please ensure MM/ML tags are present')
+
+        for read in bam.fetch():
+            if read.modified_bases is not None:
+                for k in read.modified_bases.keys():
+                    mod_names.append(k[2])
+
+            if len(mod_names) > 0:
+                break
+    else:
+        sys.exit(f'{meth_db} is not a .bam file or a .db file, exiting...')
 
     return mod_names
 
@@ -122,7 +144,65 @@ def fetch_reads(bam_fn, chrom, start, end, fetch_HP=None):
     return reads
 
 
-def fetch_mod_sites(dbs, reads, mod, start, end):
+def fetch_mod_sites(dbs, reads, mod, chrom, start, end):
+    mod_sites = {}
+
+    if dbs[0].endswith('.db'):
+        mod_sites = fetch_mod_sites_db(dbs, reads, mod, start, end)
+
+    elif dbs[0].endswith('.bam'):
+        mod_sites = fetch_mod_sites_bam(dbs, mod, chrom, start, end)
+
+    else:
+        sys.exit(f'{dbs[0]} is not a .db file or a .bam file')
+
+    return mod_sites
+
+
+def fetch_mod_sites_bam(dbs, mod, chrom, start, end):
+    mod_sites = dd(dict)
+
+    for fn in dbs:
+        bam = pysam.AlignmentFile(fn)
+
+        if chrom not in bam.references:
+            logger.warning('chromosome or contig {chrom} not found in bam: {bam.filename}')
+
+        for read in bam.fetch(chrom, start, end):
+            if read.is_duplicate or read.is_secondary or read.is_supplementary:
+                continue
+
+            if read.modified_bases is None:
+                continue
+
+            for modtype in read.modified_bases:
+                if mod != modtype[2]:
+                    continue
+
+                ref_map = dict(read.get_aligned_pairs(matches_only=True))
+
+                for (read_bp, score) in read.modified_bases[modtype]:
+                    if read_bp not in ref_map:
+                        continue
+
+                    ref_bp = ref_map[read_bp]
+
+                    if ref_bp < start or ref_bp > end:
+                        continue
+
+                    methstate = 0
+                    if score/255 > 0.8:
+                        methstate = 1
+
+                    if score/255 < 0.2:
+                        methstate = -1
+
+                    mod_sites[read.query_name][ref_bp] = methstate
+                    
+    return mod_sites
+    
+
+def fetch_mod_sites_db(dbs, reads, mod, start, end):
     c_lookup = {}
 
     for db in dbs:
@@ -130,6 +210,7 @@ def fetch_mod_sites(dbs, reads, mod, start, end):
         c_lookup[db] = conn.cursor()
 
     mod_sites = dd(dict)
+    #meth_density = dd(list)
 
     for readname in reads:
         for db in dbs:
@@ -147,7 +228,25 @@ def fetch_mod_sites(dbs, reads, mod, start, end):
                 if methstate in (1,-1): # unambiguous only
                     mod_sites[readname][int(mod_start)] = methstate
 
-                #mod_sites[readname][int(mod_start)] = float(stat)
+                # if methstate == 1:
+                #     meth_density[readname].append(1)
+                
+                # if methstate in (0, -1):
+                #     meth_density[readname].append(0)
+
+    # if max_density > 0.0:
+    #     return_sites = {}
+
+    #     for readname in mod_sites:
+    #         density = sum(meth_density[readname]) / len(meth_density[readname])
+
+    #         if density < max_density:
+    #             return_sites[readname] = mod_sites[readname]
+        
+    #         else:
+    #             logger.info('reject read %s over-dense' % readname)
+
+    #     mod_sites = return_sites
 
     return mod_sites
 
@@ -199,7 +298,7 @@ def profile(args, bam, dbs, chrom, start, end, tmpdir, obj, phase):
     if len(reads) < int(args.min_reads):
         return None
 
-    mod_sites = fetch_mod_sites(dbs, reads, args.mod, start, end)
+    mod_sites = fetch_mod_sites(dbs, reads, args.mod, chrom, start, end)
     img = site_viz(args, mod_sites, chrom, start, end, tmpdir, obj=obj)
 
     return img
@@ -248,7 +347,7 @@ def fai_to_bed(args, run_id, minlen=10e6):
     logger.info('chunking %s (%s) to bed,  window size: %d, batch size: %d' % (args.fai, run_id, width, batchsize))
 
     batch = 0
-    bed_fn = tmp + '/' + '.'.join(args.fai.split('.')[:-1]) + "." + run_id + 'batch.%d.tmp.bed' % batch
+    bed_fn = tmp + '/' + '.'.join(os.path.basename(args.fai).split('.')[:-1]) + "." + run_id + 'batch.%d.tmp.bed' % batch
     
     bed = open(bed_fn, 'w')
 
@@ -276,7 +375,7 @@ def fai_to_bed(args, run_id, minlen=10e6):
                     bed_fns.append(bed_fn)
 
                     batch += 1
-                    bed_fn = tmp + '/' + '.'.join(args.fai.split('.')[:-1]) + "." + run_id + 'batch.%d.tmp.bed' % batch
+                    bed_fn = tmp + '/' + '.'.join(os.path.basename(args.fai).split('.')[:-1]) + "." + run_id + 'batch.%d.tmp.bed' % batch
                     bed = open(bed_fn, 'w')
 
     bed.close()
@@ -355,9 +454,14 @@ def test_model(device, model, test_loader):
 
 
 def process_img_batch(device, model, img_dir, debug_dir=None):
+    
     img_xform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
 
-    modpattern_dataset = datasets.ImageFolder(root=img_dir, transform=img_xform)
+    try:
+        modpattern_dataset = datasets.ImageFolder(root=img_dir, transform=img_xform)
+    except RuntimeError:
+        logger.warning('no images found, skipping batch.')
+        return []
 
     # print(modpattern_dataset)
     # print(modpattern_dataset.class_to_idx)
@@ -401,6 +505,11 @@ def process_img_batch(device, model, img_dir, debug_dir=None):
 
 def train(args):
     args.phased = False
+
+    if args.db is None:
+        logger.info('no --db, expecting .bam with MM/ML tags')
+        args.db = args.bam
+
     dbs = args.db.split(',')
 
     avail_mods = []
@@ -435,7 +544,9 @@ def train(args):
     if not os.path.isdir(args.pos):
         logger.info('profiling positive sites from %s' % args.pos)
         pos_files = process_profiles(args, args.bam, args.db, args.pos, args.tmp+'/pos')
+        #pos_files = process_profiles(args, args.bam, args.db, args.pos, args.tmp+'/pos', max_density=float(args.max_read_density))
         pos_dir = args.tmp+'/pos'
+
     else:
         pos_files = [args.pos + '/' + fn for fn in os.listdir(args.pos)]
         pos_dir = args.pos
@@ -446,6 +557,7 @@ def train(args):
     if not os.path.isdir(args.neg):
         logger.info('profiling negative sites from %s' % args.neg)
         neg_files = process_profiles(args, args.bam, args.db, args.neg, args.tmp+'/neg', set_context=False)
+        #neg_files = process_profiles(args, args.bam, args.db, args.neg, args.tmp+'/neg', set_context=False, max_density=float(args.max_read_density))
         neg_dir = args.tmp+'/neg'
     else:
         neg_files = [args.neg + '/' + fn for fn in os.listdir(args.neg)]
@@ -561,6 +673,7 @@ def mixmodel(pos, reg_covar=1e-4, max_iter=1000, max_pos=2):
 
 
 def refine_predictions(args, bam, dbs, run_id, tmpdir, preds, phase=None, set_context=True, output_region_preds=True, min_call_depth=8, min_peak_width=3, signal_type=0):
+    logger.info('refine predictions, bam: %s, dbs: %s, run_id: %s, phase: %d' % (bam, dbs, run_id, phase))
     if set_context:
         mp.set_start_method("spawn")
 
@@ -618,7 +731,7 @@ def refine_peaks(args, bam, dbs, chrom, start, end, tmpdir, min_call_depth, min_
     pf = profile(args, bam, dbs, chrom, start, end, tmpdir, 'img', phase)
 
     if pf is None:
-        logger.warning('unable to profile %s:%d-%d' % (chrom, start, end))
+        logger.debug('unable to profile %s:%d-%d' % (chrom, start, end))
         return None
 
     m_count = (pf==1).sum(axis=0)
@@ -643,8 +756,8 @@ def refine_peaks(args, bam, dbs, chrom, start, end, tmpdir, min_call_depth, min_
     gmm_means = mixmodel(sm_frac_arr)
 
     if len(gmm_means) == 1:
-        logger.debug('site %s:%d-%d best fit by single mean, skipping.' % (chrom, start, end))
-        return None
+        logger.debug('site %s:%d-%d best fit by single mean' % (chrom, start, end))
+        return [(chrom, start, end, 0.0)]
 
     score = np.log(gmm_means[0])/np.log(gmm_means)[1]
 
@@ -676,6 +789,10 @@ def refine_peaks(args, bam, dbs, chrom, start, end, tmpdir, min_call_depth, min_
 
 
 def call(args):
+    if args.db is None:
+        logger.info('no --db, expecting .bam with MM/ML tags')
+        args.db = args.bam
+
     if not os.path.exists(args.tmp):
         logger.info('create tmp dir: %s' % args.tmp)
         os.makedirs(args.tmp)
@@ -725,6 +842,8 @@ def call(args):
         seg_predictions = process_img_batch(device, model, args.images, debug_dir=args.debug_dir)
         peaks = refine_predictions(args, args.bam, args.db, run_id, tmp_img, seg_predictions, min_call_depth=int(args.min_call_depth), min_peak_width=int(args.min_peak_width), signal_type=signal_type)
 
+        peak_bed = '%s.peaks.bed' % run_id
+
         with open(peak_bed, 'w') as bed:
             for peak in peaks:
                 bed.write('\t'.join(map(str, peak)) + '\n')
@@ -749,48 +868,271 @@ def call(args):
         phases = [0,1]
 
     for phase in phases:
-        peak_bed = '%s.peaks.bed' % run_id
-        region_bed = '%s.regions.bed' % run_id
+        bam_basename = '.'.join(os.path.basename(args.bam).split('.')[:-1])
+        peak_bed = '%s.%s.peaks.bed' % (bam_basename, run_id)
+        region_bed = '%s.%s.regions.bed' % (bam_basename, run_id)
 
         if args.phased:
-            peak_bed = '%s.phase_%d.peaks.bed' % (run_id, phase)
-            region_bed = '%s.phase_%d.regions.bed' % (run_id, phase)
+            peak_bed = '%s.%s.phase_%d.peaks.bed' % (bam_basename, run_id, phase)
+            region_bed = '%s.%s.phase_%d.regions.bed' % (bam_basename, run_id, phase)
 
-        peak_out = open(peak_bed, 'w')
+        peak_out = None
+
+        if not args.skip_refine:
+            peak_out = open(peak_bed, 'w')
+
         region_out = open(region_bed, 'w')
 
         for i, batch_bed in enumerate(call_beds):
             logger.info('batch %d of %d: building images' % (i+1, len(call_beds)))
             batch_pngs = process_profiles(args, args.bam, args.db, batch_bed, tmp_img, phase=phase, set_context=set_context)
+            #batch_pngs = process_profiles(args, args.bam, args.db, batch_bed, tmp_img, phase=phase, set_context=set_context, max_density=float(args.max_read_density))
 
             set_context = False
 
             logger.info('batch %d of %d: calling regions' % (i+1, len(call_beds)))
             seg_predictions = process_img_batch(device, model, tmp_run, debug_dir=args.debug_dir)
 
-            with open(region_bed, 'w') as bed:
-                for p in seg_predictions:
-                    fn, pred, p_neg, p_pos = p
-                    chrom, start, end = os.path.basename(fn).split('.')[0].split('_')
-                    region_out.write('\t'.join(map(str, (chrom, start, end, pred, p_neg, p_pos))) + '\n')
+            for p in seg_predictions:
+                fn, pred, p_neg, p_pos = p
+                chrom, start, end = os.path.basename(fn).split('.')[0].split('_')
+                region_out.write('\t'.join(map(str, (chrom, start, end, pred, p_neg, p_pos))) + '\n')
             
             logger.info('batch %d of %d: wrote %d regions to %s' % (i+1, len(call_beds), len(seg_predictions), region_bed))
 
-            logger.info('batch %d of %d: calling peaks' % (i+1, len(call_beds)))
-            peaks = refine_predictions(args, args.bam, args.db, run_id, tmp_run, seg_predictions, phase=phase, set_context=set_context, output_region_preds=False, min_call_depth=int(args.min_call_depth), min_peak_width=int(args.min_peak_width), signal_type=signal_type)
+            if not args.skip_refine:
+                logger.info('batch %d of %d: calling peaks' % (i+1, len(call_beds)))
+                #peaks = refine_predictions(args, args.bam, args.db, run_id, tmp_run, seg_predictions, phase=phase, set_context=set_context, output_region_preds=False, min_call_depth=int(args.min_call_depth), min_peak_width=int(args.min_peak_width), signal_type=signal_type, max_density=float(args.max_read_density))
+                peaks = refine_predictions(args, args.bam, args.db, run_id, tmp_run, seg_predictions, phase=phase, set_context=set_context, output_region_preds=False, min_call_depth=int(args.min_call_depth), min_peak_width=int(args.min_peak_width), signal_type=signal_type)
 
-            for peak in peaks:
-                peak_out.write('\t'.join(map(str, peak)) + '\n')
+                for peak in peaks:
+                    peak_out.write('\t'.join(map(str, peak)) + '\n')
 
-            logger.info('batch %d of %d: wrote %d peaks to %s' % (i+1, len(call_beds), len(peaks), peak_bed))
+                logger.info('batch %d of %d: wrote %d peaks to %s' % (i+1, len(call_beds), len(peaks), peak_bed))
 
             logger.info('batch %d of %d: cleanup files' % (i+1, len(call_beds)))
             for fn in batch_pngs:
                 os.remove(fn)
 
-    peak_out.close()
+    if not args.skip_refine:
+        peak_out.close()
+
     region_out.close()
 
+def compare(args):
+    if not os.path.exists(args.tmp):
+        logger.info('create tmp dir: %s' % args.tmp)
+        os.makedirs(args.tmp)
+    
+    run_id = '.'.join(args.data.split('.')[:-1]) + '.modpattern.' + str(uuid4())
+
+    if args.outname:
+        run_id = args.outname
+
+    signal_type = -1
+
+    if list(args.peaktype)[0] in ('u', 'U'):
+        signal_type = 0
+    
+    if list(args.peaktype)[0] in ('m', 'M'):
+        signal_type = 1
+
+    if signal_type == -1:
+        sys.exit('cannot determine peak type from input: %s, try m for methylated and u for unmethylated' % args.peaktype)
+
+    logger.info('using run id %s' % run_id)
+    tmp_img = args.tmp + '/' + run_id + '/img'
+    tmp_run = args.tmp + '/' + run_id
+    os.makedirs(tmp_img)
+    logger.info('tmp image dir: ' +  tmp_img)
+
+    data = dd(list)
+    phase_request = dd(list)
+    region_beds = []
+
+    with open(args.data) as _:
+        for line in _:
+            c = line.strip().split()
+            if len(c) < 3:
+                logger.warning("required fields for -d/--data are: .regions.bed file, .bam file, and methylation .db (generated by methylartist)")
+                sys.exit()
+
+            region_bed, bam, meth_db = c[:3]
+
+            if region_bed.endswith('.peaks.bed'):
+                sys.exit('input must be file ending in regions.bed file from modpattern call, not peaks.bed')
+
+            if not region_bed.endswith('.regions.bed'):
+                logger.warning('expected file ending in .regions.bed from modpattern call, continue anyway...')
+
+            for m_db in meth_db.split(','):
+                data[bam].append(m_db)
+            
+            region_beds.append(region_bed)
+
+            if len(c) == 4:
+                phase_request[bam].append(int(c[3]))
+
+    avail_mods = []
+
+    for dbs in data.values():
+        for db in dbs:
+            avail_mods += get_modnames(db)
+    
+    if args.mod not in avail_mods:
+        logger.error('--mod %s not available. Possible options: %s' % (args.mod, ','.join(list(set(avail_mods)))))
+        sys.exit(1)
+
+    # merge region .beds
+
+    pred_dict = {}
+
+    for bed in region_beds:
+        with open(bed) as bed_in:
+            for line in bed_in:
+                chrom, start, end, pred, p_pos, p_neg = line.strip().split()
+                loc_str = '_'.join((chrom, start, end))
+                p_pos = float(p_pos)
+                p_neg = float(p_neg)
+
+                if loc_str in pred_dict:
+                    if pred_dict[loc_str][0] != 'pos':
+                        pred_dict[loc_str] = (pred, p_pos, p_neg)
+                
+                else:
+                    pred_dict[loc_str] = (pred, p_pos, p_neg)
+                    
+    preds = []
+
+    for loc_str in pred_dict:
+        pred = [loc_str] + list(pred_dict[loc_str])
+        preds.append(pred)
+
+    set_context = True
+
+    peak_list = []
+
+    peak_forest = dd(Intersecter)
+
+    sample_names = []
+
+    for bam in data:
+        phases = [0]
+        if bam in phase_request:
+            phases = phase_request[bam]
+            args.phased = True
+    
+        else:
+            args.phased = False
+
+        for phase in phases:
+            dbs = ','.join(data[bam])
+            
+            sample_id = '%s_na' % bam
+
+            if args.phased:
+                sample_id = '%s_%d' % (bam, phase)
+
+            sample_names.append(sample_id)
+
+            peaks = refine_predictions(args, bam, dbs, run_id, tmp_run, preds, phase=phase, set_context=set_context, output_region_preds=False, min_call_depth=int(args.min_call_depth), min_peak_width=int(args.min_peak_width), signal_type=signal_type)
+            #peaks = refine_predictions(args, bam, dbs, run_id, tmp_run, preds, phase=phase, set_context=set_context, output_region_preds=False, min_call_depth=int(args.min_call_depth), min_peak_width=int(args.min_peak_width), signal_type=signal_type, max_density=float(args.max_read_density))
+
+            for peak in peaks:
+                peak = list(peak)
+                peak_list.append(peak)
+                chrom, start, end, score = peak
+                peak_forest[chrom].add_interval(Interval(start, end, value=(peak + [sample_id])))
+
+            set_context = False
+
+    w = int(args.search_window)
+    sample_names = sorted(list(set(sample_names)))
+
+    peak_list.sort(key=operator.itemgetter(0,1))
+
+    G = nx.Graph()
+
+    for peak in peak_list:
+        name = '_'.join(map(str, peak[:3]))
+        G.add_node(name)
+
+    for peak in peak_list:
+        chrom, start, end = peak[:3]
+        name = '_'.join(map(str, peak[:3]))
+
+        for o_peak in peak_forest[chrom].find(start-w, end+w):
+            o_name = '_'.join(map(str, o_peak.value[:3]))
+            G.add_edge(name, o_name)
+
+    merged_peaks = []
+
+    for cc in nx.connected_components(G):
+        chrom = None
+        min_start = None
+        max_end = None
+
+        for seg in cc:
+            chrom, start, end = seg.split('_')
+
+            if min_start is None:
+                min_start = int(start)
+            elif min_start > int(start):
+                    min_start = int(start)
+            
+            if max_end is None:
+                max_end = int(end)
+            elif max_end < int(end):
+                max_end = int(end)
+        
+        merged_peaks.append([chrom, min_start, max_end])
+
+    sample_peaks = dd(dict)
+
+    for peak in merged_peaks:
+        peak_name = '_'.join(map(str, peak))
+        chrom, start, end = peak
+
+        for sample_peak in peak_forest[chrom].find(start, end):
+            sample_id = sample_peak.value[-1]
+
+            if sample_id in sample_peaks[peak_name]:
+                sample_peaks[peak_name][sample_id].append(sample_peak.value)
+            else:
+                sample_peaks[peak_name][sample_id] = [sample_peak.value]
+
+    out_fn = '.'.join(args.data.split('.')[:-1]) + '.modpattern.compare.table.txt'
+
+    header = ['chrom', 'start', 'end']
+    for name in sample_names:
+        header.append(name+'_peak')
+        header.append(name+'_score')
+
+    rec_count = 0
+
+    with open(out_fn, 'w') as out:
+        out.write('\t'.join(header) + '\n')
+
+        for peak in sample_peaks:
+            if len(sample_peaks[peak]) == len(sample_names):
+                rec_count += 1
+                out_line = peak.split('_')
+
+                for name in sample_names:
+                    per_sample_peaks = []
+                    per_sample_scores = []
+                
+                    for p in sample_peaks[peak][name]:
+                        chrom, start, end, score = p[:4]
+                        per_sample_peaks.append('%s:%d-%d|%.3f' % (chrom, start, end, score))
+                        per_sample_scores.append(float(score))
+
+                    out_line.append(';'.join(per_sample_peaks))
+                    out_line.append(str(max(per_sample_scores)))
+
+                out.write('\t'.join(out_line) + '\n')
+
+    logger.info('modpattern compare finished, wrote %d records to %s' % (rec_count, out_fn))
 
 def main(args):
     logger.info('starting peakscan with command: %s' % ' '.join(sys.argv))
@@ -805,19 +1147,22 @@ if __name__ == '__main__':
     __version__ = "0.1"
     parser.add_argument('-v', '--version', action='version', version='%(prog)s {version}'.format(version=__version__))
 
-    parser_train = subparsers.add_parser('train')
-    parser_call  = subparsers.add_parser('call')
+    parser_train   = subparsers.add_parser('train')
+    parser_call    = subparsers.add_parser('call')
+    parser_compare = subparsers.add_parser('compare')
 
     parser_train.set_defaults(func=train)
     parser_call.set_defaults(func=call)
+    parser_compare.set_defaults(func=compare)
 
     parser_train.add_argument('-b', '--bam', required=True)
-    parser_train.add_argument('-d', '--db', required=True, help='methylartist database')
+    parser_train.add_argument('-d', '--db', default=None, help='methylartist database (unused for .bam file)')
     parser_train.add_argument('-m', '--mod', required=True, help='modificaiton (if not sure, guess and then select from list if error)')
     parser_train.add_argument('-p', '--pos', required=True, help='positive examples (BED-3 or folder with images)')
     parser_train.add_argument('-n', '--neg', required=True, help='negative examples (BED-3 or folder with images)')
     parser_train.add_argument('--min_reads', default=10)
     parser_train.add_argument('--min_motifs', default=100)
+    #parser_train.add_argument('--max_read_density', default=0.0)
     parser_train.add_argument('--images_only', default=False, action='store_true', help='output images from training input data only (do not train model)')
     parser_train.add_argument('--tmp', default='/tmp')
     parser_train.add_argument('--procs', default=1)
@@ -827,7 +1172,7 @@ if __name__ == '__main__':
     parser_call.add_argument('-b', '--bam', required=True)
     parser_call.add_argument('-f', '--fai', default=None, help='reference genome index (.fai from samtools index or list of chrom <tab> length)')
     parser_call.add_argument('--bed', default=None, help='BED=3 file (overrides --fai)')
-    parser_call.add_argument('-d', '--db', required=True, help='methylartist database(s)')
+    parser_call.add_argument('-d', '--db', default=None, help='methylartist database(s)')
     parser_call.add_argument('-m', '--mod', required=True, help='modificaiton (if not sure, guess and then select from list if error)')
     parser_call.add_argument('--model', required=True, help='trained model')
     parser_call.add_argument('-p', '--peaktype', required=True, help='methylated (m) or unmethylated (u)')
@@ -835,14 +1180,30 @@ if __name__ == '__main__':
     parser_call.add_argument('--phased', default=False, action='store_true')
     parser_call.add_argument('-o', '--outname', default=None, help='output basename (default to random UUID)')
     parser_call.add_argument('-s', '--batchsize', default=10000, help='batch size (default=10000)')
+    parser_call.add_argument('--skip_refine', default=False, action='store_true', help='skip refinement, use for multi-sample comparison')
     parser_call.add_argument('--min_call_depth', default=8)
     parser_call.add_argument('--min_peak_width', default=3)
-    parser_call.add_argument('--min_reads', default=10)
-    parser_call.add_argument('--min_motifs', default=100)
+    parser_call.add_argument('--min_reads', default=10, help='minimum reads to consider a segment (default=10)')
+    parser_call.add_argument('--min_motifs', default=100, help='minimum motifs to consider a segment (default=100)')
+    #parser_call.add_argument('--max_read_density', default=0.0)
     parser_call.add_argument('--procs', default=1)
     parser_call.add_argument('--images', default=None, help='for debugging')
     parser_call.add_argument('--debug_dir', default=None, help='for debugging')
     parser_call.add_argument('--tmp', default='/tmp')
+
+    parser_compare.add_argument('-d', '--data', required=True, help='whitespace-delimited file: .region.bed, .bam, .db, phase (0/1, optional)')
+    parser_compare.add_argument('-p', '--peaktype', required=True, help='methylated (m) or unmethylated (u)')
+    parser_compare.add_argument('-m', '--mod', required=True, help='modificaiton (if not sure, guess and then select from list if error)')
+    parser_compare.add_argument('-o', '--outname', default=None, help='output basename (default to random UUID)')
+    parser_compare.add_argument('-w', '--search_window', default=500)
+    parser_compare.add_argument('--min_call_depth', default=8)
+    parser_compare.add_argument('--min_peak_width', default=3)
+    parser_compare.add_argument('--min_reads', default=10, help='minimum reads to consider a segment (default=10)')
+    parser_compare.add_argument('--min_motifs', default=100, help='minimum motifs to consider a segment (default=100)')
+    #parser_compare.add_argument('--max_read_density', default=0.0)
+    parser_compare.add_argument('--procs', default=1)
+    parser_compare.add_argument('--tmp', default='/tmp')
+
 
     args = parser.parse_args()
     main(args)
