@@ -85,12 +85,21 @@ class ModProfileClassifier(nn.Module):
 
 
 def binary_acc(y_pred, y_test):
+    #print(f'y_pred: {y_pred}')
+    #print(f'y_test: {y_test}')
     y_pred_tag = torch.log_softmax(y_pred, dim = 1)
     _, y_pred_tags = torch.max(y_pred_tag, dim = 1)
     correct_results_sum = (y_pred_tags == y_test).sum().float()
     acc = correct_results_sum/y_test.shape[0]
     acc = torch.round(acc * 100)
     return acc
+
+
+# def multiclass_acc(y_pred, y_test):
+
+    
+
+#     return acc
 
 
 def get_modnames(meth_db):
@@ -210,7 +219,6 @@ def fetch_mod_sites_db(dbs, reads, mod, start, end):
         c_lookup[db] = conn.cursor()
 
     mod_sites = dd(dict)
-    #meth_density = dd(list)
 
     for readname in reads:
         for db in dbs:
@@ -227,26 +235,6 @@ def fetch_mod_sites_db(dbs, reads, mod, start, end):
 
                 if methstate in (1,-1): # unambiguous only
                     mod_sites[readname][int(mod_start)] = methstate
-
-                # if methstate == 1:
-                #     meth_density[readname].append(1)
-                
-                # if methstate in (0, -1):
-                #     meth_density[readname].append(0)
-
-    # if max_density > 0.0:
-    #     return_sites = {}
-
-    #     for readname in mod_sites:
-    #         density = sum(meth_density[readname]) / len(meth_density[readname])
-
-    #         if density < max_density:
-    #             return_sites[readname] = mod_sites[readname]
-        
-    #         else:
-    #             logger.info('reject read %s over-dense' % readname)
-
-    #     mod_sites = return_sites
 
     return mod_sites
 
@@ -429,7 +417,7 @@ def train_model(device, model, criterion, optimizer, train_loader, val_loader, m
         accuracy_stats['val'].append(val_epoch_acc/len(val_loader))
         logger.info(f'Epoch {e+0:02}: | Train Loss: {train_epoch_loss/len(train_loader):.5f} | Val Loss: {val_epoch_loss/len(val_loader):.5f} | Train Acc: {train_epoch_acc/len(train_loader):.3f}| Val Acc: {val_epoch_acc/len(val_loader):.3f}')
 
-        if train_epoch_acc/len(train_loader) > 99.0 and val_epoch_acc/len(val_loader) > 99.0:
+        if e > 25 and train_epoch_acc/len(train_loader) > 99.0 and val_epoch_acc/len(val_loader) > 96.0:
             logger.info('end early')
             break
 
@@ -450,7 +438,7 @@ def test_model(device, model, test_loader):
     y_pred_list = [i[0][0][0] for i in y_pred_list]
     y_true_list = [i[0] for i in y_true_list]
 
-    print(classification_report(y_true_list, y_pred_list))
+    #print(classification_report(y_true_list, y_pred_list))
 
 
 def process_img_batch(device, model, img_dir, debug_dir=None):
