@@ -16,7 +16,7 @@ dependencies:
       - pysam
       - scikit-learn
       - scipy
-      - setuptools==80.4.0
+      - setuptools
       - torch==1.12.1
       - torch-summary
       - torchvision==0.6.0
