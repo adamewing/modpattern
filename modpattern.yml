@@ -1,23 +1,22 @@
 name: modpattern
 channels:
+  - pytorch
   - defaults
   - conda-forge
   - bioconda
-  - https://repo.anaconda.com/pkgs/main
-  - https://repo.anaconda.com/pkgs/r
 dependencies:
-  - pip=25.1.1=pyh145f28c_0
-  - python=3.13.3=hf636f53_101_cp313
+  - pip=20.0.2
+  - python=3.8.3
   - pip:
-      - bx-python==0.13.0
-      - matplotlib==3.10.3
-      - networkx==3.4.2
-      - numpy==2.2.5
-      - pillow==11.2.1
-      - pysam==0.23.0
-      - scikit-learn==1.6.1
-      - scipy==1.15.3
+      - bx-python
+      - matplotlib
+      - networkx
+      - numpy
+      - pillow==8.0.1
+      - pysam
+      - scikit-learn
+      - scipy
       - setuptools==80.4.0
-      - torch==2.7.0
-      - torch-summary==1.4.5
-      - torchvision==0.22.0
+      - torch==1.12.1
+      - torch-summary
+      - torchvision==0.6.0
