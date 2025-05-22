@@ -1,0 +1,22 @@
+name: modpattern
+channels:
+  - pytorch
+  - defaults
+  - conda-forge
+  - bioconda
+dependencies:
+  - pip=20.0.2
+  - python=3.8.3
+  - pip:
+      - bx-python
+      - matplotlib
+      - networkx
+      - numpy
+      - pillow==8.0.1
+      - pysam
+      - scikit-learn
+      - scipy
+      - setuptools
+      - torch==1.12.1
+      - torch-summary
+      - torchvision==0.6.0

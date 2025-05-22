@@ -327,7 +327,7 @@ def process_profiles(args, bam, dbs, fn, tmpdir, phase=0, obj='png', set_context
 
 
 def fai_to_bed(args, run_id, minlen=10e6):
-    width = int(args. width)
+    width = int(args.width)
     tmp = args.tmp
     batchsize = int(args.batchsize)
     bed_fns = []
@@ -817,7 +817,7 @@ def call(args):
         logger.error('--mod %s not available. Possible options: %s' % (args.mod, ','.join(list(set(avail_mods)))))
         sys.exit(1)
 
-    model = torch.load(args.model)
+    model = torch.load(args.model, weights_only=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info('torch device: %s' % device)
@@ -847,6 +847,9 @@ def call(args):
             logger.warning('using bed file %s instead of .fai file %s' % (args.bed, args.fai))
         
         call_beds = fai_to_bed(args, run_id)
+
+    if not args.bed and not args.fai:
+        sys.exit('must provide either a bed or fai file as regions of interest; exiting...')
 
     set_context = True
 
